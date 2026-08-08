@@ -3,6 +3,7 @@ import requests
 import json
 import os
 from dotenv import load_dotenv
+import time
 
 load_dotenv()
 
@@ -43,5 +44,7 @@ def push():
     else:
         print("No changes")
 
-pull_and_import()
-push()
+while True:
+    pull_and_import()
+    push()
+    time.sleep(30)
