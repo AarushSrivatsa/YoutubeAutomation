@@ -1,0 +1,33 @@
+{
+  "updatedAt": "2026-08-08T16:33:02.862Z",
+  "createdAt": "2026-08-08T16:32:40.936Z",
+  "id": "xzetpPpBZVslqdgn",
+  "name": "YoutubeAutomation",
+  "active": false,
+  "isArchived": false,
+  "nodes": [],
+  "connections": {},
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  },
+  "staticData": null,
+  "meta": null,
+  "nodeGroups": [],
+  "pinData": {},
+  "versionId": "7e2444fa-36b7-4d48-bc69-584565654bb6",
+  "activeVersionId": null,
+  "triggerCount": 0,
+  "shared": [
+    {
+      "updatedAt": "2026-08-08T16:32:40.940Z",
+      "createdAt": "2026-08-08T16:32:40.940Z",
+      "role": "workflow:owner",
+      "workflowId": "xzetpPpBZVslqdgn",
+      "projectId": "WTl7ZsJPfp8osMEf"
+    }
+  ],
+  "activeVersion": null,
+  "tags": []
+}
