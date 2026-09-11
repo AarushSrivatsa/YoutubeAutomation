@@ -9,6 +9,7 @@ voiceover.py's target_wpm so script length lines up with intended audio duration
 import os
 import json
 import time
+import math
 from groq import Groq
 from langgraph.types import interrupt
 
@@ -123,6 +124,32 @@ def _sys_prompt_prose() -> str:
         "Maintain continuity with the previous context and do not restate or recap it. Follow the "
         "JSON schema exactly."
     )
+
+
+def _print_progress_bar(current: int, total: int, stage: str, width: int = 30) -> None:
+    frac = current / total if total else 1.0
+    filled = int(width * frac)
+    bar = "#" * filled + "-" * (width - filled)
+    pct = int(frac * 100)
+    print(f"\r[{bar}] {pct:3d}% ({current}/{total}) {stage}", end="", flush=True)
+    if current >= total:
+        print()
+
+
+def _emit_progress(progress: dict, stage: str, increment: bool = True) -> None:
+    """Shared progress payload — same shape consumed by the CLI bar and (later) any UI widget."""
+    if increment:
+        progress["current"] += 1
+    progress["stage"] = stage
+    cb = progress.get("on_progress")
+    if cb:
+        cb({"current": progress["current"], "total": progress["total"], "stage": stage})
+    else:
+        _print_progress_bar(progress["current"], progress["total"], stage)
+
+
+def _init_progress(total: int, on_progress=None) -> dict:
+    return {"current": 0, "total": total, "stage": "", "on_progress": on_progress}
 
 
 def calculate_segment_count(target_words: int, words_per_segment_target: int = WORDS_PER_SEGMENT_TARGET) -> dict:
@@ -307,10 +334,12 @@ def generate_story(idea: str, wpm: int = DEFAULT_WPM, video_length_min: float = 
                     target_words: int = None, num_segments: int = None,
                     model: str = MODEL, max_output_tokens: int = MAX_OUTPUT_TOKENS,
                     words_per_segment_target: int = WORDS_PER_SEGMENT_TARGET,
-                    batch_size: int = SEGMENTS_PER_BATCH) -> dict:
+                    batch_size: int = SEGMENTS_PER_BATCH, on_progress=None) -> dict:
     """
     idea -> plan -> story bible -> batched (<=2/call) prose generation.
     target_words derives from wpm * video_length_min unless passed directly.
+    on_progress(dict{current,total,stage}) called on each LLM call if given, else a CLI bar is printed.
+    This same payload shape is the intended hook for a future UI progress bar.
     OUT: success, idea, title, segments:[{id,text,original_text,status}], wpm, video_length_min,
          target_words, story_arc, characters, locations, segment_plans, model_used, error
     """
@@ -332,12 +361,17 @@ def generate_story(idea: str, wpm: int = DEFAULT_WPM, video_length_min: float = 
         num_segments = sizing["num_segments"]
         seg_word_targets = sizing["words_per_segment"]
 
+    total_batches = math.ceil(num_segments / batch_size)
+    progress = _init_progress(1 + total_batches, on_progress)
+
+    _emit_progress(progress, "planning story", increment=False)
     plan = plan_story(idea, num_segments, seg_word_targets, model, max_output_tokens)
     if not plan["success"]:
         return {
             "success": False, "error": plan["error"], "idea": idea, "title": "", "segments": [],
             "wpm": wpm, "video_length_min": video_length_min, "target_words": target_words
         }
+    _emit_progress(progress, "story planned")
 
     plan_segments = plan["segments"]
     for i, s in enumerate(plan_segments):
@@ -350,6 +384,8 @@ def generate_story(idea: str, wpm: int = DEFAULT_WPM, video_length_min: float = 
     context_tail = ""
 
     for batch in batches:
+        ids = [s["id"] for s in batch]
+        _emit_progress(progress, f"generating segments {ids}", increment=False)
         result = generate_segment_batch(idea, batch, bible, context_tail, model, max_output_tokens)
         if not result["success"]:
             return {
@@ -365,6 +401,7 @@ def generate_story(idea: str, wpm: int = DEFAULT_WPM, video_length_min: float = 
             })
             bible = update_story_bible(bible, s_plan, text)
             context_tail = text[-400:]
+        _emit_progress(progress, f"segments {ids} done")
 
     return {
         "success": True,
@@ -426,7 +463,8 @@ def story_gen_node(state: dict) -> dict:
         model=state.get("model", MODEL),
         max_output_tokens=state.get("max_output_tokens", MAX_OUTPUT_TOKENS),
         words_per_segment_target=state.get("words_per_segment_target", WORDS_PER_SEGMENT_TARGET),
-        batch_size=state.get("batch_size", SEGMENTS_PER_BATCH)
+        batch_size=state.get("batch_size", SEGMENTS_PER_BATCH),
+        on_progress=state.get("on_progress")
     )
 
 
