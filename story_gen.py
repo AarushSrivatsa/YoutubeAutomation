@@ -1,16 +1,25 @@
 """
 story_gen.py — batched story generation + human-in-loop segment review.
 Idea -> Groq LLM (batched calls) -> segmented story -> human keep/edit/skip/regenerate -> final text.
+
+target_words = wpm * video_length_min (unless target_words passed explicitly). wpm should match
+voiceover.py's target_wpm so script length lines up with intended audio duration.
 """
 
 import os
 import json
+import time
 from groq import Groq
 from langgraph.types import interrupt
 
 MODEL = "openai/gpt-oss-120b"       # Apache-2.0, Groq production tier, strict JSON support
 MAX_OUTPUT_TOKENS = 6000            # per-call completion cap, stays well under 65536 limit + TPM-friendly
 SEGMENTS_PER_CALL = 4                # segments requested per API call (batching = handles multi-hour stories)
+MAX_RETRIES = 2                      # per-batch retry on API/JSON failure (rate limits etc.)
+RETRY_DELAY_SEC = 5
+
+DEFAULT_WPM = 150                    # match voiceover.py target_wpm default
+DEFAULT_VIDEO_LENGTH_MIN = 60
 
 _SEGMENT_ITEM = {
     "type": "object",
@@ -42,7 +51,7 @@ def _get_client() -> Groq:
     return _client
 
 
-def _sys_prompt(batch_n: int, words_per_segment: int, is_first: bool, context_tail: str) -> str:
+def _sys_prompt(idea: str, batch_n: int, words_per_segment: int, is_first: bool, context_tail: str) -> str:
     base = (
         "Write sleep stories for a relaxation YouTube channel. Priority: comfortable, not "
         "beautiful. Plain, warm, unpolished-sounding sentences — not literature, not purple "
@@ -50,35 +59,49 @@ def _sys_prompt(batch_n: int, words_per_segment: int, is_first: bool, context_ta
         "softly to someone falling asleep next to them at 1am. Short simple sentences. "
         "Everyday words. Some repetition is fine and sounds more human, not less. Intimate, "
         "close, low-key — like the narrator is right there in the room, half-whispering. "
-        "No violence, no jump-scares, no sudden events, no cliffhangers. Slow pacing."
+        "Slow pacing."
+    )
+    theme = (
+        f" Theme: \"{idea}\". Story MUST clearly be built from this theme — its setting, "
+        "characters, objects, or world. Reinterpret it for a calm sleepy mood: strip out any "
+        "violence, danger, action, conflict, jump-scares, sudden events, or cliffhangers, but "
+        "keep the theme's world and characters recognizable throughout every segment. Do NOT "
+        "fall back to a generic rain/bedroom scene unless the theme itself is literally that."
     )
     if is_first:
         task = (
             f" Write the OPENING {batch_n} segments of the story, ~{words_per_segment} words each. "
-            "Set the scene, unhurried."
+            "Set the scene, unhurried, inside the theme's world."
         )
     else:
         task = (
             f" CONTINUE the same story from where it left off. Story so far ends with:\n"
             f"\"...{context_tail}\"\n"
             f"Write the NEXT {batch_n} segments, ~{words_per_segment} words each. Keep same tone, "
-            "same pacing, do not restart or recap."
+            "same pacing, same theme/world, do not restart or recap."
         )
-    return base + task + " Follow JSON schema exactly."
+    return base + theme + task + " Follow JSON schema exactly."
 
 
-def generate_story(idea: str, target_words: int = 3000, num_segments: int = None,
+def generate_story(idea: str, wpm: int = DEFAULT_WPM, video_length_min: float = DEFAULT_VIDEO_LENGTH_MIN,
+                    target_words: int = None, num_segments: int = None,
                     model: str = MODEL, max_output_tokens: int = MAX_OUTPUT_TOKENS,
                     segments_per_call: int = SEGMENTS_PER_CALL) -> dict:
     """
     idea -> segmented sleep story, generated in batches (handles multi-hour targets, avoids
     per-call token limit errors).
-    OUT: success, idea, title, segments:[{id,text,original_text,status}], model_used, error
+    target_words derives from wpm * video_length_min unless target_words passed directly.
+    OUT: success, idea, title, segments:[{id,text,original_text,status}], wpm, video_length_min,
+         target_words, model_used, error
     """
     idea = (idea or "").strip()
     if not idea:
         return {"success": False, "error": "idea empty", "segments": []}
 
+    if wpm <= 0 or video_length_min <= 0:
+        return {"success": False, "error": "wpm and video_length_min must be > 0", "segments": []}
+
+    target_words = target_words or round(wpm * video_length_min)
     num_segments = num_segments or max(4, target_words // 400)
     words_per_segment = max(100, target_words // num_segments)
 
@@ -90,27 +113,41 @@ def generate_story(idea: str, target_words: int = 3000, num_segments: int = None
 
     while len(all_segments) < num_segments:
         batch_n = min(segments_per_call, num_segments - len(all_segments))
-        sys_prompt = _sys_prompt(batch_n, words_per_segment, next_id == 1, context_tail)
+        sys_prompt = _sys_prompt(idea, batch_n, words_per_segment, next_id == 1, context_tail)
 
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": f"Story idea: {idea}"}
-                ],
-                temperature=0.9,
-                reasoning_effort="low",
-                include_reasoning=False,
-                max_completion_tokens=max_output_tokens,
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {"name": "sleep_story_batch", "strict": True, "schema": _BATCH_SCHEMA}
-                }
-            )
-            data = json.loads(resp.choices[0].message.content)
-        except Exception as e:
-            return {"success": False, "error": str(e), "segments": all_segments}
+        data = None
+        last_err = None
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": f"Theme: {idea}. Write it as a calming sleep story."}
+                    ],
+                    temperature=0.9,
+                    reasoning_effort="low",
+                    include_reasoning=False,
+                    max_completion_tokens=max_output_tokens,
+                    response_format={
+                        "type": "json_schema",
+                        "json_schema": {"name": "sleep_story_batch", "strict": True, "schema": _BATCH_SCHEMA}
+                    }
+                )
+                data = json.loads(resp.choices[0].message.content)
+                break
+            except Exception as e:
+                last_err = e
+                if attempt < MAX_RETRIES:
+                    time.sleep(RETRY_DELAY_SEC)
+
+        if data is None:
+            return {
+                "success": False,
+                "error": f"batch failed after {MAX_RETRIES + 1} attempts: {last_err}",
+                "idea": idea, "title": title, "segments": all_segments,
+                "wpm": wpm, "video_length_min": video_length_min, "target_words": target_words
+            }
 
         if next_id == 1:
             title = data.get("title", "")
@@ -128,6 +165,9 @@ def generate_story(idea: str, target_words: int = 3000, num_segments: int = None
         "idea": idea,
         "title": title,
         "segments": all_segments[:num_segments],
+        "wpm": wpm,
+        "video_length_min": video_length_min,
+        "target_words": target_words,
         "model_used": model,
         "error": None
     }
@@ -167,7 +207,9 @@ def assemble_story(segments: list, title: str = "") -> dict:
 def story_gen_node(state: dict) -> dict:
     return generate_story(
         idea=state.get("idea", ""),
-        target_words=state.get("target_words", 3000),
+        wpm=state.get("wpm", DEFAULT_WPM),
+        video_length_min=state.get("video_length_min", DEFAULT_VIDEO_LENGTH_MIN),
+        target_words=state.get("target_words"),
         num_segments=state.get("num_segments"),
         model=state.get("model", MODEL),
         max_output_tokens=state.get("max_output_tokens", MAX_OUTPUT_TOKENS),
@@ -225,6 +267,8 @@ if __name__ == "__main__":
 
     class StoryState(TypedDict, total=False):
         idea: str
+        wpm: int
+        video_length_min: float
         target_words: int
         num_segments: int
         model: str
@@ -247,8 +291,21 @@ if __name__ == "__main__":
 
     graph = g.compile(checkpointer=InMemorySaver())
 
+    # user input — topic + target params, no hardcoded idea
+    idea = input("Story topic/idea: ").strip()
+    wpm_raw = input(f"WPM [{DEFAULT_WPM}]: ").strip()
+    len_raw = input(f"Video length, minutes [{DEFAULT_VIDEO_LENGTH_MIN}]: ").strip()
+    wpm = int(wpm_raw) if wpm_raw else DEFAULT_WPM
+    video_length_min = float(len_raw) if len_raw else DEFAULT_VIDEO_LENGTH_MIN
+
     cfg = {"configurable": {"thread_id": "story-1"}}
-    result = graph.invoke({"idea": "a lighthouse keeper counting stars", "target_words": 2000}, cfg)
+    result = graph.invoke({"idea": idea, "wpm": wpm, "video_length_min": video_length_min}, cfg)
+
+    if result.get("success") is False:
+        print(f"generation failed: {result.get('error')}")
+        print(f"got {len(result.get('segments', []))} segments before failing")
+        raise SystemExit(1)
+
     print(result["__interrupt__"][0].value)
 
     decisions = {"1": {"action": "keep"}, "2": {"action": "skip"}}
