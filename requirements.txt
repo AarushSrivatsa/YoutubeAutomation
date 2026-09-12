@@ -1,4 +1,45 @@
-# pip install -r requirements.txt --break-system-packages   (if on an externally-managed env)
-piper-tts>=1.8.0
+# ── API ──────────────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+python-multipart>=0.0.12
+pydantic>=2.9.0
+pydantic-settings>=2.6.0
+httpx>=0.28.0
 
-# system dependency, not pip-installable: ffmpeg (only needed if you output .mp3 instead of .wav)
+# ── LangGraph + Postgres checkpointer ────────────────────────────────────────
+langgraph>=0.2.60
+langgraph-checkpoint-postgres>=2.0.6
+psycopg[binary,pool]>=3.2.3
+
+# ── LLM ──────────────────────────────────────────────────────────────────────
+groq>=0.12.0
+
+# ── Web search ───────────────────────────────────────────────────────────────
+tavily-python>=0.5.0
+
+# ── TTS ──────────────────────────────────────────────────────────────────────
+kokoro
+soundfile>=0.12.1
+
+# ── Supabase (DB + storage) ──────────────────────────────────────────────────
+supabase>=2.10.0
+
+# ── Redis + async job queue ──────────────────────────────────────────────────
+arq>=0.26.1
+redis>=5.2.1
+
+# ── Embeddings for pgvector similarity search ─────────────────────────────────
+# Local, free — via Ollama's /api/embeddings endpoint (nomic-embed-text, 768-dim).
+# No SDK needed, calls go through httpx (already a dependency).
+# Setup: `ollama pull nomic-embed-text` and make sure `ollama serve` is running.
+
+# ── Observability ─────────────────────────────────────────────────────────────
+langsmith>=0.1.147
+
+# ── Utils ─────────────────────────────────────────────────────────────────────
+numpy
+python-dotenv>=1.0.1
+
+# ── System dependencies (not pip-installable) ─────────────────────────────────
+# ffmpeg      — audio/video encoding + stitching
+# espeak-ng   — Kokoro fallback for out-of-dictionary words (apt install espeak-ng)
