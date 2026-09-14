@@ -42,6 +42,7 @@ class JobOut(BaseModel):
     error_message: Optional[str] = None
     wpm: int
     video_length_min: float
+    voice_model: str = "af_heart"
     story: Optional[StoryOut] = None
     segments: list[SegmentOut] = []
     created_at: datetime
@@ -80,7 +81,7 @@ class ProgressEvent(BaseModel):
 class JobEnqueued(BaseModel):
     job_id: UUID
     status: str = "pending"
-    message: str = "Job enqueued. Poll /jobs/{job_id}/progress for updates."
+    message: str = "Job started in the background. Poll /jobs/{job_id}/progress for updates."
 
 
 class EditEnqueued(BaseModel):

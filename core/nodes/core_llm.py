@@ -4,15 +4,21 @@ core_llm.py — single node, two modes.
   • Segments in state     → verification mode  (is the story good? what needs fixing?)
 
 Uses a fast Groq model with strict JSON output for both.
+
+Both modes are intentionally fail-open: a Groq failure here should not kill the
+whole pipeline (routing falls back to "no search needed", verification falls
+back to "approved"). Every failure is still logged loudly so it's visible.
 """
 from __future__ import annotations
 import json
-import os
+import logging
 from groq import Groq
 from config import get_settings
 from core.state import PipelineState
 from services.redis_service import publish_job_progress
+from errors import GroqAPIError
 
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 _client: Groq | None = None
@@ -21,6 +27,8 @@ _client: Groq | None = None
 def _get_client() -> Groq:
     global _client
     if _client is None:
+        if not settings.groq_api_key:
+            raise GroqAPIError("GROQ_API_KEY is not set")
         _client = Groq(api_key=settings.groq_api_key)
     return _client
 
@@ -91,6 +99,7 @@ def core_llm_node(state: PipelineState) -> PipelineState:
     job_id = state.get("job_id", "")
     segments = state.get("segments")
 
+    logger.info("[job=%s] core_llm_node entered (mode=%s)", job_id, "verification" if segments else "routing")
     if not segments:
         return _routing_pass(state, job_id)
     else:
@@ -119,6 +128,10 @@ def _routing_pass(state: PipelineState, job_id: str) -> PipelineState:
             },
         )
         data = json.loads(resp.choices[0].message.content)
+        logger.info(
+            "[job=%s] routing decision: needs_search=%s query=%r",
+            job_id, data["needs_search"], data.get("search_query", ""),
+        )
         publish_job_progress(
             job_id, 0, 0,
             f"routing done — {'search needed' if data['needs_search'] else 'no search needed'}"
@@ -129,8 +142,10 @@ def _routing_pass(state: PipelineState, job_id: str) -> PipelineState:
             "search_query": data.get("search_query", ""),
         }
     except Exception as e:
-        # Fail open: skip search on routing error
-        return {**state, "needs_search": False, "search_query": "", "error": str(e)}
+        # Fail open: skip search on routing error, but log it loudly.
+        logger.exception("[job=%s] routing pass failed — falling back to needs_search=False", job_id)
+        publish_job_progress(job_id, 0, 0, f"routing failed, continuing without search: {e}")
+        return {**state, "needs_search": False, "search_query": "", "error": str(GroqAPIError("routing failed", e))}
 
 
 def _verification_pass(state: PipelineState, job_id: str) -> PipelineState:
@@ -168,6 +183,10 @@ def _verification_pass(state: PipelineState, job_id: str) -> PipelineState:
             },
         )
         data = json.loads(resp.choices[0].message.content)
+        logger.info(
+            "[job=%s] verification result: status=%s flagged_segments=%d",
+            job_id, data["status"], len(data.get("segment_feedback", [])),
+        )
         publish_job_progress(job_id, 0, 0, f"verification: {data['status']}")
         return {
             **state,
@@ -176,13 +195,15 @@ def _verification_pass(state: PipelineState, job_id: str) -> PipelineState:
             "revision_round": revision_round + 1,
         }
     except Exception as e:
-        # Fail open: approve on verification error so pipeline doesn't stall
+        # Fail open: approve on verification error so pipeline doesn't stall.
+        logger.exception("[job=%s] verification pass failed — approving story as-is", job_id)
+        publish_job_progress(job_id, 0, 0, f"verification failed, approving as-is: {e}")
         return {
             **state,
             "verification_status": "approved",
             "segment_feedback": [],
             "revision_round": revision_round + 1,
-            "error": str(e),
+            "error": str(GroqAPIError("verification failed", e)),
         }
 
 
@@ -194,11 +215,16 @@ def route_after_core_llm(state: PipelineState) -> str:
     No segments yet  → routing just happened → go to tavily or story.
     Segments exist   → verification just happened → go to story (revision) or voiceover.
     """
+    job_id = state.get("job_id", "")
     if not state.get("segments"):
-        return "tavily" if state.get("needs_search") else "story"
+        next_node = "tavily" if state.get("needs_search") else "story"
+        logger.info("[job=%s] route_after_core_llm (routing mode) -> %s", job_id, next_node)
+        return next_node
 
     status = state.get("verification_status", "approved")
     revision_round = state.get("revision_round", 0)
     if status == "needs_revision" and revision_round < 2:
+        logger.info("[job=%s] route_after_core_llm -> story (revision round %d)", job_id, revision_round)
         return "story"
+    logger.info("[job=%s] route_after_core_llm -> voiceover (status=%s, round=%d)", job_id, status, revision_round)
     return "voiceover"

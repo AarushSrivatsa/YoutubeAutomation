@@ -24,8 +24,9 @@ soundfile
 # ── Supabase (DB + storage) ──────────────────────────────────────────────────
 supabase>=2.10.0
 
-# ── Redis + async job queue ──────────────────────────────────────────────────
-arq>=0.26.1
+# ── Redis ────────────────────────────────────────────────────────────────────
+# Only used for pub/sub progress events (SSE) now — background jobs run
+# in-process via FastAPI BackgroundTasks, not a separate ARQ worker.
 redis>=5.2.1
 
 # ── Embeddings for pgvector similarity search ─────────────────────────────────

@@ -3,13 +3,17 @@ story_gen.py — general-purpose long-form story generation.
 prompt -> plan (blueprint) -> story bible -> batched prose (<=2 segs/call) -> assembly.
 Tone, genre, and style are fully driven by the user prompt. No hardcoded framing.
 """
+from __future__ import annotations
 
-import os
 import json
+import logging
 import time
 import math
 from groq import Groq
 from config import get_settings
+from errors import GroqAPIError
+
+logger = logging.getLogger(__name__)
 settings = get_settings()
 
 
@@ -80,6 +84,8 @@ _client = None
 def _get_client() -> Groq:
     global _client
     if _client is None:
+        if not settings.groq_api_key:
+            raise GroqAPIError("GROQ_API_KEY is not set")
         _client = Groq(api_key=settings.groq_api_key)
     return _client
 
@@ -108,25 +114,17 @@ def _sys_prompt_prose() -> str:
     )
 
 
-def _print_progress_bar(current: int, total: int, stage: str, width: int = 30) -> None:
-    frac = current / total if total else 1.0
-    filled = int(width * frac)
-    bar = "#" * filled + "-" * (width - filled)
-    pct = int(frac * 100)
-    print(f"\r[{bar}] {pct:3d}% ({current}/{total}) {stage}", end="", flush=True)
-    if current >= total:
-        print()
-
-
 def _emit_progress(progress: dict, stage: str, increment: bool = True) -> None:
     if increment:
         progress["current"] += 1
     progress["stage"] = stage
+    logger.info("story_gen progress %d/%d — %s", progress["current"], progress["total"], stage)
     cb = progress.get("on_progress")
     if cb:
-        cb({"current": progress["current"], "total": progress["total"], "stage": stage})
-    else:
-        _print_progress_bar(progress["current"], progress["total"], stage)
+        try:
+            cb({"current": progress["current"], "total": progress["total"], "stage": stage})
+        except Exception:
+            logger.exception("on_progress callback raised — ignoring so generation can continue")
 
 
 def _init_progress(total: int, on_progress=None) -> dict:
@@ -163,9 +161,11 @@ def plan_story(
         f"Produce the full blueprint now, one plan entry per segment id 1..{num_segments}, in order."
     )
 
-    last_err = None
+    last_err: Exception | None = None
     for attempt in range(MAX_RETRIES + 1):
         try:
+            logger.info("plan_story: calling Groq (%s) attempt %d/%d, num_segments=%d",
+                        model, attempt + 1, MAX_RETRIES + 1, num_segments)
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -186,6 +186,8 @@ def plan_story(
                 },
             )
             data = json.loads(resp.choices[0].message.content)
+            logger.info("plan_story: succeeded, title=%r, %d segments planned",
+                        data.get("title", ""), len(data.get("segments", [])))
             return {
                 "success": True,
                 "title": data.get("title", ""),
@@ -197,9 +199,11 @@ def plan_story(
             }
         except Exception as e:
             last_err = e
+            logger.warning("plan_story: attempt %d/%d failed: %s", attempt + 1, MAX_RETRIES + 1, e)
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY_SEC)
 
+    logger.error("plan_story: all %d attempts failed", MAX_RETRIES + 1)
     return {
         "success": False,
         "title": "",
@@ -207,7 +211,7 @@ def plan_story(
         "characters": [],
         "locations": [],
         "segments": [],
-        "error": f"planning failed after {MAX_RETRIES + 1} attempts: {last_err}",
+        "error": str(GroqAPIError(f"planning failed after {MAX_RETRIES + 1} attempts", last_err)),
     }
 
 
@@ -296,9 +300,11 @@ def generate_segment_batch(
         "Write the CURRENT SEGMENTS listed above, in order, each following its own plan's purpose exactly."
     )
 
-    last_err = None
+    last_err: Exception | None = None
+    ids = [s["id"] for s in batch_segments]
     for attempt in range(MAX_RETRIES + 1):
         try:
+            logger.info("generate_segment_batch: segments %s, attempt %d/%d", ids, attempt + 1, MAX_RETRIES + 1)
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
@@ -319,16 +325,20 @@ def generate_segment_batch(
                 },
             )
             data = json.loads(resp.choices[0].message.content)
+            logger.info("generate_segment_batch: segments %s succeeded", ids)
             return {"success": True, "segments": data["segments"], "error": None}
         except Exception as e:
             last_err = e
+            logger.warning("generate_segment_batch: segments %s attempt %d/%d failed: %s",
+                           ids, attempt + 1, MAX_RETRIES + 1, e)
             if attempt < MAX_RETRIES:
                 time.sleep(RETRY_DELAY_SEC)
 
+    logger.error("generate_segment_batch: segments %s failed after %d attempts", ids, MAX_RETRIES + 1)
     return {
         "success": False,
         "segments": [],
-        "error": f"batch failed after {MAX_RETRIES + 1} attempts: {last_err}",
+        "error": str(GroqAPIError(f"batch {ids} failed after {MAX_RETRIES + 1} attempts", last_err)),
     }
 
 
@@ -350,11 +360,15 @@ def generate_story(
     """
     idea = (idea or "").strip()
     if not idea:
+        logger.error("generate_story called with empty idea")
         return {"success": False, "error": "idea is empty", "segments": []}
     if wpm <= 0 or video_length_min <= 0:
+        logger.error("generate_story called with invalid wpm=%s video_length_min=%s", wpm, video_length_min)
         return {"success": False, "error": "wpm and video_length_min must be > 0", "segments": []}
 
     target_words = target_words or round(wpm * video_length_min)
+    logger.info("generate_story: starting, target_words=%d, wpm=%s, video_length_min=%s",
+                target_words, wpm, video_length_min)
 
     if num_segments:
         base = target_words // num_segments
@@ -371,6 +385,7 @@ def generate_story(
     _emit_progress(progress, "planning story", increment=False)
     plan = plan_story(idea, num_segments, seg_word_targets, model, max_output_tokens)
     if not plan["success"]:
+        logger.error("generate_story: planning failed, aborting: %s", plan["error"])
         return {
             "success": False,
             "error": plan["error"],
@@ -400,6 +415,8 @@ def generate_story(
         _emit_progress(progress, f"generating segments {ids}", increment=False)
         result = generate_segment_batch(idea, batch, bible, context_tail, model, max_output_tokens)
         if not result["success"]:
+            logger.error("generate_story: batch %s failed, aborting with %d segments already generated",
+                        ids, len(all_segments))
             return {
                 "success": False,
                 "error": result["error"],
@@ -426,6 +443,7 @@ def generate_story(
             context_tail = text[-400:]
         _emit_progress(progress, f"segments {ids} done")
 
+    logger.info("generate_story: completed successfully, %d segments generated", len(all_segments))
     return {
         "success": True,
         "idea": idea,
@@ -461,6 +479,7 @@ def regenerate_segment(
         "Keep the same rough length and narrative purpose. "
         "Output only the rewritten segment text, no preamble."
     )
+    logger.info("regenerate_segment: instruction=%r", (instruction or "")[:120])
     try:
         resp = _get_client().chat.completions.create(
             model=model,
@@ -470,18 +489,22 @@ def regenerate_segment(
             include_reasoning=False,
             max_completion_tokens=max_output_tokens,
         )
+        text = resp.choices[0].message.content.strip()
+        logger.info("regenerate_segment: succeeded (%d chars)", len(text))
         return {
             "success": True,
-            "text": resp.choices[0].message.content.strip(),
+            "text": text,
             "error": None,
         }
     except Exception as e:
-        return {"success": False, "text": original_text, "error": str(e)}
+        logger.exception("regenerate_segment: failed, keeping original text")
+        return {"success": False, "text": original_text, "error": str(GroqAPIError("regenerate_segment failed", e))}
 
 
 def assemble_story(segments: list, title: str = "") -> dict:
     parts = [s["text"] for s in segments if s.get("status") != "skipped"]
     story_text = "\n\n".join(parts)
+    logger.debug("assemble_story: %d segments assembled, %d words", len(parts), len(story_text.split()))
     return {
         "story_text": story_text,
         "word_count": len(story_text.split()),

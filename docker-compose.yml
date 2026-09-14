@@ -19,6 +19,10 @@ services:
       - ollama_data:/root/.ollama
     # First run: `docker compose exec ollama ollama pull nomic-embed-text`
 
+  # Single process does everything: serves the API and runs pipeline/edit jobs
+  # in the background (see background_jobs.py — no separate worker container,
+  # and important: --workers must stay at 1, since background jobs and the
+  # in-process concurrency semaphore live in this one process's memory).
   api:
     build: .
     restart: unless-stopped
@@ -30,23 +34,11 @@ services:
     depends_on:
       - redis
       - ollama
-    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 2
-
-  worker:
-    build: .
-    restart: unless-stopped
-    env_file: .env
-    environment:
-      - OLLAMA_BASE_URL=http://ollama:11434
-    depends_on:
-      - redis
-      - ollama
-    # Separate container for heavy compute (TTS + ffmpeg)
-    command: python -m worker.tasks
+    command: uvicorn main:app --host 0.0.0.0 --port 8000 --workers 1
     deploy:
       resources:
         limits:
-          memory: 4G  # Kokoro needs headroom
+          memory: 4G  # Kokoro TTS + ffmpeg need headroom; this now runs in the API container
 
 volumes:
   redis_data:
