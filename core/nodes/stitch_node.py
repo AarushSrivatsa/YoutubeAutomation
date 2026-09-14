@@ -58,12 +58,14 @@ def stitch_node(state: PipelineState) -> PipelineState:
         logger.exception("[job=%s] stitch_node: could not write image to %s", job_id, image_path)
         return {**state, "error": str(HTTPFetchError(f"could not write image locally: {e}", e))}
 
-    # ffmpeg: loop image over audio duration
+    # ffmpeg: loop image over audio duration.
+    # pad filter rounds width/height up to even numbers — libx264 requires this.
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-loop", "1",
         "-i", image_path,
         "-i", audio_path,
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264",
         "-tune", "stillimage",
         "-c:a", "aac",

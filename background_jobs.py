@@ -3,15 +3,6 @@ background_jobs.py — the actual job functions, run via FastAPI's BackgroundTas
 instead of a separate ARQ worker process. One process (uvicorn) does everything:
 serves the API and runs pipeline/edit jobs in the background after the response
 is sent.
-
-Trade-off you're accepting by doing it this way: if the API process restarts
-mid-job, that job is just gone (ARQ + Redis would have retried it from its
-queue). For a single-instance deploy that's usually fine. If you ever need
-multi-instance horizontal scaling or job retries, this is the piece you'd
-swap back to a real queue.
-
-A semaphore caps how many jobs run at once (settings.max_jobs) so multiple
-concurrent TTS + ffmpeg jobs don't fight over CPU/RAM on the same box.
 """
 from __future__ import annotations
 import asyncio
@@ -38,10 +29,7 @@ configure_logging()
 logger = logging.getLogger(__name__)
 settings = get_settings()
 
-# Caps how many pipeline/edit jobs run concurrently in this process.
 _JOB_SEMAPHORE = asyncio.Semaphore(settings.max_jobs)
-
-# Hard ceiling so a stuck job can't hang forever and quietly eat a worker slot.
 _JOB_TIMEOUT_SEC = 60 * 60  # 1 hour
 
 
@@ -77,10 +65,6 @@ async def run_pipeline(
         }
 
         try:
-            # Run the full LangGraph pipeline in a thread (all nodes are sync) with
-            # a hard timeout so one stuck job can't hold its semaphore slot forever.
-            # This stops either at the approval gate (before voiceover) or at the
-            # real end of the pipeline — see is_awaiting_approval below.
             result = await asyncio.wait_for(
                 asyncio.to_thread(run_graph, job_id, initial_state),
                 timeout=_JOB_TIMEOUT_SEC,
@@ -98,9 +82,6 @@ async def run_pipeline(
                 logger.error("[job=%s] pipeline finished with an error: %s", job_id, result["error"])
                 update_job_status(sb, job_id, "failed", error_message=result["error"])
                 publish_job_progress(job_id, 0, 0, f"failed: {result['error']}")
-            else:
-                logger.info("[job=%s] pipeline finished successfully", job_id)
-            # supabase_node already updates the record to 'completed' on success
 
         except asyncio.TimeoutError:
             logger.error("[job=%s] pipeline timed out after %ds", job_id, _JOB_TIMEOUT_SEC)
@@ -119,15 +100,9 @@ async def run_pipeline(
             publish_job_progress(job_id, 0, 0, f"failed: {e}")
 
 
-# ── Approval gate (script review before voiceover) ─────────────────────────────
+# ── Approval gate ──────────────────────────────────────────────────────────────
 
 async def _persist_pending_script(job_id: str, state: dict) -> None:
-    """
-    Called when the graph pauses at the approval gate. Writes the generated
-    story/segments to the DB right away so GET /jobs/{job_id} can show the
-    script for review — otherwise it only exists inside the LangGraph
-    checkpoint, which the API never reads directly.
-    """
     sb = get_supabase()
     try:
         upsert_story_record(
@@ -148,17 +123,9 @@ async def _persist_pending_script(job_id: str, state: dict) -> None:
             upsert_segment_records(sb, job_id, segments)
         except SupabaseError:
             logger.exception("[job=%s] failed to persist pending segment records", job_id)
-    else:
-        logger.warning("[job=%s] approval gate reached with no segments to persist", job_id)
 
 
 async def edit_pending_segment(job_id: str, segment_index: int, new_text: str) -> None:
-    """
-    Edits a segment's text while the job is sitting at the approval gate.
-    No voiceover/stitch has happened yet, so this just patches the checkpointed
-    graph state (so the edit is picked up when resumed) and keeps the DB copy
-    of the script in sync for anyone reading it via GET /jobs/{job_id}.
-    """
     from core.story_gen import assemble_story
 
     logger.info("[job=%s] editing pending segment %s (pre-approval)", job_id, segment_index)
@@ -179,7 +146,6 @@ async def edit_pending_segment(job_id: str, segment_index: int, new_text: str) -
         raise ValueError(f"segment {segment_index} not found in pending script")
 
     assembled = assemble_story(segments, state.get("title", ""))
-
     await asyncio.to_thread(
         patch_pending_state, job_id, {"segments": segments, "story_text": assembled["story_text"]}
     )
@@ -188,19 +154,12 @@ async def edit_pending_segment(job_id: str, segment_index: int, new_text: str) -
     try:
         await asyncio.to_thread(upsert_segment_records, sb, job_id, segments)
     except SupabaseError:
-        logger.exception("[job=%s] failed to sync edited segment to DB (graph state was still patched)", job_id)
+        logger.exception("[job=%s] failed to sync edited segment to DB", job_id)
 
     publish_job_progress(job_id, 0, 0, f"segment {segment_index} updated, still awaiting approval")
-    logger.info("[job=%s] pending segment %s edited successfully", job_id, segment_index)
 
 
 async def resume_pipeline_after_approval(job_id: str) -> None:
-    """
-    Resumes a job sitting at the approval gate — continues on to voiceover,
-    stitch, and upload using whatever script is currently checkpointed
-    (including any edits made via PATCH /jobs/{job_id}/segments/{idx} while
-    it was awaiting approval).
-    """
     async with _JOB_SEMAPHORE:
         logger.info("[job=%s] resuming pipeline after approval", job_id)
         sb = get_supabase()
@@ -222,8 +181,6 @@ async def resume_pipeline_after_approval(job_id: str) -> None:
                 logger.error("[job=%s] pipeline failed after approval: %s", job_id, result["error"])
                 update_job_status(sb, job_id, "failed", error_message=result["error"])
                 publish_job_progress(job_id, 0, 0, f"failed: {result['error']}")
-            else:
-                logger.info("[job=%s] pipeline finished successfully after approval", job_id)
 
         except asyncio.TimeoutError:
             logger.error("[job=%s] pipeline timed out after approval (%ds)", job_id, _JOB_TIMEOUT_SEC)
@@ -246,15 +203,11 @@ async def resume_pipeline_after_approval(job_id: str) -> None:
 
 async def run_edit_pipeline(
     job_id: str,
-    edit_type: str,       # "segment" | "image"
+    edit_type: str,
     segment_index: int | None = None,
     new_text: str | None = None,
     new_image_url: str | None = None,
 ) -> None:
-    """
-    edit_type="segment" → update text in DB, re-assemble, re-voiceover, re-stitch, re-upload.
-    edit_type="image"   → update image_url in DB, re-stitch only with existing audio, re-upload.
-    """
     async with _JOB_SEMAPHORE:
         logger.info("[job=%s] run_edit_pipeline starting (edit_type=%s, segment_index=%s)",
                     job_id, edit_type, segment_index)
@@ -288,8 +241,6 @@ async def run_edit_pipeline(
             else:
                 raise ValueError(f"unknown edit_type: {edit_type}")
 
-            logger.info("[job=%s] run_edit_pipeline finished successfully", job_id)
-
         except Exception as e:
             logger.exception("[job=%s] run_edit_pipeline failed", job_id)
             try:
@@ -308,9 +259,7 @@ async def _edit_segment(sb, job_id, job, segments, segment_index, new_text, tmp_
         sb.table("segments").update(
             {"text": new_text, "status": "edited"}
         ).eq("job_id", job_id).eq("segment_index", segment_index).execute()
-        logger.info("[job=%s] segment %s text updated in DB", job_id, segment_index)
     except Exception as e:
-        logger.exception("[job=%s] failed to update segment %s in DB", job_id, segment_index)
         raise SupabaseError(f"failed to update segment {segment_index}: {e}", e) from e
 
     updated_segments = [
@@ -323,9 +272,7 @@ async def _edit_segment(sb, job_id, job, segments, segment_index, new_text, tmp_
     ]
     assembled = assemble_story(story_dicts, job.get("title", ""))
     story_text = assembled["story_text"]
-    logger.info("[job=%s] story re-assembled after edit (%d words)", job_id, assembled["word_count"])
 
-    # Preserve the job's original voice — don't silently fall back to the global default.
     voice_model = job.get("voice_model") or settings.default_voice
     publish_job_progress(job_id, 0, 0, "re-generating voiceover…")
     audio_path = os.path.join(tmp_dir, "audio.mp3")
@@ -338,7 +285,7 @@ async def _edit_segment(sb, job_id, job, segments, segment_index, new_text, tmp_
     await _upload_results(sb, job_id, audio_path, video_path)
 
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    logger.info("[job=%s] segment edit complete, tmp dir cleaned up", job_id)
+    logger.info("[job=%s] segment edit complete", job_id)
 
 
 async def _swap_image(sb, job_id, job, new_image_url, tmp_dir):
@@ -347,7 +294,6 @@ async def _swap_image(sb, job_id, job, new_image_url, tmp_dir):
     try:
         sb.table("jobs").update({"image_url": new_image_url}).eq("id", job_id).execute()
     except Exception as e:
-        logger.exception("[job=%s] failed to update image_url in DB", job_id)
         raise SupabaseError(f"failed to update image_url: {e}", e) from e
 
     publish_job_progress(job_id, 0, 0, "downloading existing audio…")
@@ -365,7 +311,6 @@ async def _swap_image(sb, job_id, job, new_image_url, tmp_dir):
                 f.write(r.content)
         logger.info("[job=%s] existing audio downloaded (%d bytes)", job_id, len(r.content))
     except Exception as e:
-        logger.exception("[job=%s] failed to download existing audio from %s", job_id, audio_url)
         raise HTTPFetchError(f"failed to download existing audio: {e}", e) from e
 
     video_path = os.path.join(tmp_dir, "video.mp4")
@@ -380,12 +325,11 @@ async def _swap_image(sb, job_id, job, new_image_url, tmp_dir):
             {"status": "completed", "video_url": video_url}
         ).eq("id", job_id).execute()
     except Exception as e:
-        logger.exception("[job=%s] failed to update job record after image swap", job_id)
         raise SupabaseError(f"failed to update job record: {e}", e) from e
 
     publish_job_progress(job_id, 0, 0, "complete")
     shutil.rmtree(tmp_dir, ignore_errors=True)
-    logger.info("[job=%s] image swap complete, tmp dir cleaned up", job_id)
+    logger.info("[job=%s] image swap complete", job_id)
 
 
 async def _run_voiceover(story_text, audio_path, wpm, voice_model, job_id):
@@ -402,12 +346,7 @@ async def _run_voiceover(story_text, audio_path, wpm, voice_model, job_id):
             cache_dir=os.path.join(settings.tmp_dir, ".kokoro_cache"),
             use_cuda=settings.use_cuda,
         )
-        logger.info("[job=%s] voiceover regeneration complete", job_id)
-    except MediaProcessingError:
-        logger.exception("[job=%s] voiceover regeneration failed", job_id)
-        raise
     except Exception as e:
-        logger.exception("[job=%s] voiceover regeneration failed (unexpected)", job_id)
         raise MediaProcessingError(f"voiceover regeneration failed: {e}", e) from e
 
 
@@ -426,13 +365,14 @@ async def _run_stitch(image_url, audio_path, video_path, job_id, tmp_dir):
                 f.write(r.content)
         logger.info("[job=%s] image downloaded for stitching (%d bytes)", job_id, len(r.content))
     except Exception as e:
-        logger.exception("[job=%s] failed to download image for stitching", job_id)
         raise HTTPFetchError(f"failed to download image {image_url}: {e}", e) from e
 
+    # pad filter rounds width/height up to even numbers — libx264 requires this.
     cmd = [
         "ffmpeg", "-y", "-loglevel", "error",
         "-loop", "1", "-i", image_path,
         "-i", audio_path,
+        "-vf", "pad=ceil(iw/2)*2:ceil(ih/2)*2",
         "-c:v", "libx264", "-tune", "stillimage",
         "-c:a", "aac", "-b:a", "192k",
         "-pix_fmt", "yuv420p",
@@ -444,10 +384,8 @@ async def _run_stitch(image_url, audio_path, video_path, job_id, tmp_dir):
         logger.info("[job=%s] ffmpeg stitch complete -> %s", job_id, video_path)
     except subprocess.CalledProcessError as e:
         stderr = e.stderr.decode(errors="replace")[:500] if e.stderr else ""
-        logger.exception("[job=%s] ffmpeg stitch failed: %s", job_id, stderr)
         raise MediaProcessingError(f"ffmpeg stitch failed: {stderr}", e) from e
     except FileNotFoundError as e:
-        logger.exception("[job=%s] ffmpeg binary not found", job_id)
         raise MediaProcessingError("ffmpeg is not installed or not on PATH", e) from e
 
 
@@ -467,8 +405,7 @@ async def _upload_results(sb, job_id, audio_path, video_path):
             {"status": "completed", "audio_url": audio_url, "video_url": video_url}
         ).eq("id", job_id).execute()
     except Exception as e:
-        logger.exception("[job=%s] failed to update job record after upload", job_id)
         raise SupabaseError(f"failed to update job record: {e}", e) from e
 
-    logger.info("[job=%s] upload complete: audio_url=%s video_url=%s", job_id, audio_url, video_url)
+    logger.info("[job=%s] upload complete", job_id)
     publish_job_progress(job_id, 0, 0, "complete")
