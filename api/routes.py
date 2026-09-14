@@ -16,6 +16,15 @@ right after the script is written and verified, before any TTS/ffmpeg time is
 spent on it. GET /jobs/{job_id} shows the script (story + segments) at that
 point; PATCH the segments to edit it; POST /approve when it's ready to become
 a video.
+
+NOTE on job status transitions (approve/retry): these use try_claim_job(),
+an atomic conditional UPDATE, instead of "read status, check it, then write
+status elsewhere" — the latter is a read-then-write race where two
+near-simultaneous requests for the same job can both pass the check and
+both get scheduled as background pipeline runs, which then collide with
+each other over the same tmp_dir/thread_id (this is what caused a stray
+second `resume_graph` invocation to crash ffmpeg with a dimension error
+right after a job had already completed successfully once).
 """
 from __future__ import annotations
 import json
@@ -44,6 +53,7 @@ from services.supabase_service import (
     get_supabase,
     list_jobs,
     update_job_status,
+    try_claim_job,
     upload_bytes,
     get_public_url,
     similarity_search,
@@ -220,14 +230,17 @@ async def retry_job(job_id: str, background_tasks: BackgroundTasks):
         raise HTTPException(status_code=404, detail="Job not found")
 
     job = data["job"]
-    if job["status"] != "failed":
+
+    if not job.get("image_url"):
+        raise HTTPException(status_code=422, detail="Job has no stored image_url to retry with")
+
+    # Atomic claim: only one concurrent /retry call for this job can win this,
+    # so run_pipeline can never be scheduled twice for the same job_id.
+    if not try_claim_job(sb, job_id, expected_status="failed", new_status="pending"):
         raise HTTPException(
             status_code=409,
             detail=f"Only failed jobs can be retried (current status: {job['status']})",
         )
-
-    if not job.get("image_url"):
-        raise HTTPException(status_code=422, detail="Job has no stored image_url to retry with")
 
     background_tasks.add_task(
         run_pipeline,
@@ -268,11 +281,13 @@ async def approve_job(job_id: str, background_tasks: BackgroundTasks):
     if not data:
         raise HTTPException(status_code=404, detail="Job not found")
 
-    job = data["job"]
-    if job["status"] != "awaiting_approval":
+    # Atomic claim instead of read-then-write: only one concurrent /approve
+    # call for this job can ever win this, so resume_pipeline_after_approval
+    # can never be scheduled twice for the same job_id/thread_id.
+    if not try_claim_job(sb, job_id, expected_status="awaiting_approval", new_status="running"):
         raise HTTPException(
             status_code=409,
-            detail=f"Job is not awaiting approval (current status: {job['status']})",
+            detail="Job is not awaiting approval (already approved, running, or in another state)",
         )
 
     background_tasks.add_task(resume_pipeline_after_approval, job_id=job_id)

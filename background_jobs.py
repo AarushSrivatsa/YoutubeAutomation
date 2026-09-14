@@ -12,7 +12,14 @@ import shutil
 
 from logging_config import configure_logging
 from config import get_settings
-from core.graph import run_graph, resume_graph, is_awaiting_approval, get_pending_state, patch_pending_state
+from core.graph import (
+    run_graph,
+    resume_graph,
+    reset_thread,
+    is_awaiting_approval,
+    get_pending_state,
+    patch_pending_state,
+)
 from services.supabase_service import (
     get_supabase,
     update_job_status,
@@ -54,6 +61,16 @@ async def run_pipeline(
             logger.exception("[job=%s] could not mark job as running, continuing anyway", job_id)
 
         publish_job_progress(job_id, 0, 0, "pipeline started")
+
+        # run_pipeline always means "run the graph from START with this input" —
+        # true both for a brand-new job and for a /retry of a previously-failed
+        # one. But thread_id == job_id, and a retry reuses the same job_id, so
+        # without clearing the old checkpoint first, LangGraph would silently
+        # resume from wherever that thread's last run left off instead of
+        # actually starting over (skipping the approval-gate interrupt,
+        # carrying stale revision counters, etc.). No-op for a genuinely new
+        # job that has no prior checkpoint yet.
+        await asyncio.to_thread(reset_thread, job_id)
 
         initial_state = {
             "job_id": job_id,

@@ -118,6 +118,40 @@ def _config_for(job_id: str) -> dict:
     return {"configurable": {"thread_id": job_id}}
 
 
+def reset_thread(job_id: str) -> None:
+    """
+    Deletes any existing checkpoint history for this job's LangGraph thread.
+
+    thread_id == job_id in this app. run_pipeline() is meant to always start
+    the graph fresh at START with a brand-new initial_state — that's true for
+    a brand-new job, but ALSO for a /retry of a previously-failed job, which
+    reuses the same job_id and therefore the same thread_id.
+
+    LangGraph does not treat graph.invoke(initial_state, config) as "restart
+    at START" when a checkpoint already exists for that thread — it resumes
+    from wherever that thread's last checkpoint left off. Without this reset,
+    a retried job silently continues from old accumulated state instead of
+    actually starting over: the approval-gate interrupt can get skipped
+    entirely (because that thread already consumed it in an earlier run),
+    and counters like revision_round keep climbing across "restarts" instead
+    of resetting (e.g. hitting round 5 despite a coded cap of 2).
+
+    Safe to call even when no checkpoint exists yet (a brand-new job) — it's
+    a no-op in that case, so this can unconditionally run before every fresh
+    pipeline invocation.
+    """
+    logger.info("[job=%s] resetting LangGraph checkpoint thread before fresh run", job_id)
+    graph = get_graph()
+    try:
+        graph.checkpointer.delete_thread(job_id)
+        logger.info("[job=%s] checkpoint thread reset", job_id)
+    except Exception:
+        # Non-fatal: worst case a retry behaves like the old (buggy) resume
+        # behavior for this one run, but we don't want a checkpoint-cleanup
+        # hiccup to block the retry outright.
+        logger.exception("[job=%s] failed to reset checkpoint thread before run (continuing anyway)", job_id)
+
+
 def run_graph(job_id: str, initial_state: dict) -> dict:
     """
     Synchronous graph invocation. Called inside asyncio.to_thread() from a FastAPI

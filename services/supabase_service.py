@@ -145,6 +145,49 @@ def get_job_record(sb: Client, job_id: str) -> dict | None:
         raise SupabaseError(f"get_job_record failed for job {job_id}: {e}", e) from e
 
 
+def try_claim_job(sb: Client, job_id: str, expected_status: str, new_status: str) -> bool:
+    """
+    Atomically transitions a job's status ONLY if it is currently `expected_status`,
+    via a single conditional UPDATE (WHERE id=... AND status=...).
+
+    Why this exists: endpoints like /approve and /retry used to do a plain
+    read (get_job_with_story_and_segments) followed by a status check, then
+    scheduled a background pipeline run. That's a classic read-then-write
+    race — two near-simultaneous requests (a double-click, a retried HTTP
+    call, etc.) can both read the same starting status before either write
+    lands, both pass the check, and both get scheduled. Both then invoke the
+    LangGraph pipeline for the *same* job_id/thread_id concurrently, and
+    since every node writes to the same tmp_dir (keyed only by job_id), the
+    two runs can stomp on each other's image/audio/video files mid-write —
+    this is what produced the "height not divisible by 2" ffmpeg crash
+    right after a job had already completed successfully once.
+
+    Returns True if THIS call won the claim (i.e. it performed the update),
+    False if another request already transitioned the job first — in which
+    case the caller should reject the request instead of scheduling
+    anything.
+    """
+    logger.info("Attempting to claim job %s: %s -> %s", job_id, expected_status, new_status)
+    try:
+        result = (
+            sb.table("jobs")
+            .update({"status": new_status})
+            .eq("id", job_id)
+            .eq("status", expected_status)
+            .execute()
+        )
+        claimed = bool(result.data)
+        logger.info(
+            "Claim %s for job %s (%s -> %s)",
+            "succeeded" if claimed else "lost (already transitioned by another request)",
+            job_id, expected_status, new_status,
+        )
+        return claimed
+    except Exception as e:
+        logger.exception("try_claim_job failed for job %s", job_id)
+        raise SupabaseError(f"try_claim_job failed for job {job_id}: {e}", e) from e
+
+
 def update_job_status(sb: Client, job_id: str, status: str, **kwargs) -> None:
     logger.info("Updating job %s -> status=%s extra=%s", job_id, status, list(kwargs.keys()))
     update_data = {"status": status, **kwargs}
