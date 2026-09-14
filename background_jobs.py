@@ -176,9 +176,20 @@ async def edit_pending_segment(job_id: str, segment_index: int, new_text: str) -
     publish_job_progress(job_id, 0, 0, f"segment {segment_index} updated, still awaiting approval")
 
 
-async def resume_pipeline_after_approval(job_id: str) -> None:
+async def _resume_and_finalize(job_id: str, log_label: str, progress_msg: str) -> None:
+    """
+    Shared tail end of every "call resume_graph() and see what happened" path.
+    resume_graph() just does graph.invoke(None, config) — LangGraph figures out
+    where a thread left off from its checkpoint, regardless of *why* it stopped
+    there (deliberate interrupt_before gate vs. process getting killed mid-node).
+    So the outcome-handling here is identical for both callers below:
+      - approved script -> voiceover/stitch/supabase run, may finish or error
+      - crash-recovered job -> whatever node it died in re-runs, then continues
+        onward, and CAN legitimately land back on the approval gate again if
+        the crash happened before the script was ever approved.
+    """
     async with _JOB_SEMAPHORE:
-        logger.info("[job=%s] resuming pipeline after approval", job_id)
+        logger.info("[job=%s] %s", job_id, log_label)
         sb = get_supabase()
 
         try:
@@ -186,7 +197,7 @@ async def resume_pipeline_after_approval(job_id: str) -> None:
         except SupabaseError:
             logger.exception("[job=%s] could not mark job as running, continuing anyway", job_id)
 
-        publish_job_progress(job_id, 0, 0, "approved — generating voiceover…")
+        publish_job_progress(job_id, 0, 0, progress_msg)
 
         try:
             result = await asyncio.wait_for(
@@ -194,13 +205,21 @@ async def resume_pipeline_after_approval(job_id: str) -> None:
                 timeout=_JOB_TIMEOUT_SEC,
             )
 
+            paused = await asyncio.to_thread(is_awaiting_approval, job_id)
+            if paused:
+                await _persist_pending_script(job_id, result)
+                update_job_status(sb, job_id, "awaiting_approval", error_message=None)
+                logger.info("[job=%s] landed back on the approval gate after resume", job_id)
+                publish_job_progress(job_id, 0, 0, "awaiting_approval: script ready for review")
+                return
+
             if result.get("error"):
-                logger.error("[job=%s] pipeline failed after approval: %s", job_id, result["error"])
+                logger.error("[job=%s] pipeline failed after resume: %s", job_id, result["error"])
                 update_job_status(sb, job_id, "failed", error_message=result["error"])
                 publish_job_progress(job_id, 0, 0, f"failed: {result['error']}")
 
         except asyncio.TimeoutError:
-            logger.error("[job=%s] pipeline timed out after approval (%ds)", job_id, _JOB_TIMEOUT_SEC)
+            logger.error("[job=%s] pipeline timed out after resume (%ds)", job_id, _JOB_TIMEOUT_SEC)
             try:
                 update_job_status(sb, job_id, "failed", error_message="pipeline timed out")
             except SupabaseError:
@@ -208,12 +227,39 @@ async def resume_pipeline_after_approval(job_id: str) -> None:
             publish_job_progress(job_id, 0, 0, "failed: pipeline timed out")
 
         except Exception as e:
-            logger.exception("[job=%s] resume_pipeline_after_approval crashed", job_id)
+            logger.exception("[job=%s] %s crashed", job_id, log_label)
             try:
                 update_job_status(sb, job_id, "failed", error_message=str(e))
             except SupabaseError:
                 logger.exception("[job=%s] could not even mark job as failed", job_id)
             publish_job_progress(job_id, 0, 0, f"failed: {e}")
+
+
+async def resume_pipeline_after_approval(job_id: str) -> None:
+    await _resume_and_finalize(
+        job_id,
+        log_label="resuming pipeline after approval",
+        progress_msg="approved — generating voiceover…",
+    )
+
+
+async def recover_interrupted_job(job_id: str) -> None:
+    """
+    Called from main.py's startup sweep for a job that was still 'running' when
+    the previous process died (crash, OOM, deploy, Ctrl+C) but whose LangGraph
+    checkpoint thread shows pending work (core.graph.is_resumable() == True).
+
+    Unlike the old behavior (mark failed, force a full /retry from the original
+    prompt), this continues the SAME thread_id from exactly the node it never
+    finished — Postgres checkpointer already has every node's output up to
+    that point, so story generation / voiceover / etc. already done doesn't
+    get redone.
+    """
+    await _resume_and_finalize(
+        job_id,
+        log_label="recovering interrupted job from last checkpoint",
+        progress_msg="recovered after restart — resuming from last checkpoint…",
+    )
 
 
 # ── Edit pipeline ──────────────────────────────────────────────────────────────

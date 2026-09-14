@@ -183,6 +183,31 @@ def is_awaiting_approval(job_id: str) -> bool:
     return paused
 
 
+def is_resumable(job_id: str) -> bool:
+    """
+    True if this job's LangGraph thread has a checkpoint AND still has work
+    queued (snapshot.next is non-empty) — i.e. execution stopped somewhere
+    before END. Covers both cases with one check:
+      - a deliberate pause at the approval gate (is_awaiting_approval), and
+      - an abrupt crash mid-node (process killed, OOM, deploy) — the
+        Postgres checkpointer already has the state as of the last
+        completed superstep, with `next` pointing at whatever node didn't
+        finish.
+
+    False when there's no checkpoint at all (job never got as far as a
+    single graph step) or the thread already ran to END (next == ()) —
+    neither of those has anything to resume from.
+
+    Used on startup to tell a genuinely orphaned job apart from one that
+    just needs resume_graph() called on it instead of being marked failed.
+    """
+    graph = get_graph()
+    snapshot = graph.get_state(_config_for(job_id))
+    resumable = bool(snapshot and snapshot.next)
+    logger.debug("[job=%s] is_resumable=%s (next=%s)", job_id, resumable, getattr(snapshot, "next", None))
+    return resumable
+
+
 def get_pending_state(job_id: str) -> dict | None:
     """Returns the current checkpointed state values for a job, or None if there is none."""
     graph = get_graph()
