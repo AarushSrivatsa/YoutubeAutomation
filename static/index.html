@@ -9,10 +9,10 @@
 <body>
 
   <header>
-    <h1>🎬 Narrative Video Generator</h1>
+    <h1>Narrative Video Generator</h1>
     <nav>
-      <button id="nav-jobs" class="nav-btn active">All Jobs</button>
-      <button id="nav-new" class="nav-btn">+ New Job</button>
+      <button id="nav-jobs" class="nav-btn active">All jobs</button>
+      <button id="nav-new" class="nav-btn">New job</button>
     </nav>
   </header>
 
@@ -22,8 +22,15 @@
     <section id="view-jobs" class="view">
       <div class="view-header">
         <h2>Jobs</h2>
-        <button id="refresh-jobs-btn" class="ghost">⟳ Refresh</button>
+        <button id="refresh-jobs-btn" class="ghost">↻ Refresh</button>
       </div>
+
+      <form id="search-form" class="search-row">
+        <input type="text" id="search-input" placeholder="Search by meaning — “lighthouse ghost story”">
+        <button type="submit" class="ghost">Search</button>
+        <button type="button" id="clear-search-btn" class="ghost hidden">Clear</button>
+      </form>
+
       <div id="jobs-list" class="jobs-list">
         <p class="muted">Loading…</p>
       </div>
@@ -59,7 +66,7 @@
             </label>
           </div>
 
-          <button type="submit" id="create-btn">Generate</button>
+          <button type="submit" id="create-btn" class="primary">Generate</button>
         </form>
       </div>
     </section>
@@ -71,23 +78,24 @@
       <div class="card">
         <div class="detail-header">
           <h2>Status: <span id="status-badge" class="badge">-</span></h2>
-          <button id="delete-btn" class="danger">🗑 Delete job</button>
+          <button id="delete-btn" class="danger">Delete job</button>
         </div>
         <p class="muted">Job ID: <code id="job-id-display"></code></p>
         <p id="prompt-display" class="prompt-display"></p>
         <div id="progress-log" class="progress-log"></div>
         <div id="error-box" class="error-box hidden"></div>
-        <button id="retry-btn" class="hidden">🔁 Retry job</button>
+        <button id="retry-btn" class="hidden">↻ Retry job</button>
       </div>
 
-      <div id="script-card" class="card hidden">
-        <h2>Review the script</h2>
+      <div id="script-card" class="card accent-edge hidden">
+        <h2 id="script-card-heading">Review the script</h2>
+        <p id="script-hint" class="muted script-hint"></p>
         <h3 id="script-title"></h3>
         <div id="segments-list"></div>
-        <button id="approve-btn" class="primary">✅ Approve &amp; generate video</button>
+        <button id="approve-btn" class="primary">Approve &amp; generate video</button>
       </div>
 
-      <div id="result-card" class="card hidden">
+      <div id="result-card" class="card success-edge hidden">
         <h2>Result</h2>
         <video id="result-video" controls></video>
         <audio id="result-audio" controls></audio>
@@ -95,11 +103,18 @@
           <a id="video-link" href="#" target="_blank">Open video URL</a>
           <a id="audio-link" href="#" target="_blank">Open audio URL</a>
         </div>
+        <form id="swap-image-form" class="swap-image-row">
+          <label>
+            Replace image <span class="muted">(re-stitches the video with the existing audio)</span>
+            <input type="file" id="swap-image-input" accept="image/*" required>
+          </label>
+          <button type="submit" id="swap-image-btn" class="ghost">Swap image</button>
+        </form>
       </div>
     </section>
 
   </main>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/script.js"></script>
 </body>
 </html>
