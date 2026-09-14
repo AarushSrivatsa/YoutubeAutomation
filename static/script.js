@@ -65,6 +65,13 @@ function showSection(el, show = true) {
   el.classList.toggle("hidden", !show);
 }
 
+// Grows a textarea to fit its full content, so reading/editing a long
+// segment doesn't mean scrolling around inside a tiny fixed-height box.
+function autoGrowTextarea(el) {
+  el.style.height = "auto";
+  el.style.height = el.scrollHeight + "px";
+}
+
 // ── View switching ───────────────────────────────────────────────────────
 function showView(name) {
   viewJobs.classList.toggle("hidden", name !== "jobs");
@@ -277,8 +284,8 @@ async function pollJob(jobId) {
 
     const hasScript = job.segments && job.segments.length > 0;
     if (hasScript && SCRIPT_VISIBLE_STATUSES.includes(job.status)) {
-      renderScript(job);
       showSection(scriptCard, true);
+      renderScript(job);
       const isPending = job.status === "awaiting_approval";
       showSection(approveBtn, isPending);
       scriptCardHeading.textContent = isPending ? "Review the script" : "Script";
@@ -331,6 +338,7 @@ function buildSegmentEl(seg) {
     div.dataset.dirty = "1";
     div.classList.add("dirty");
     div.classList.remove("saved");
+    autoGrowTextarea(textarea);
   });
   return div;
 }
@@ -351,6 +359,8 @@ function renderScript(job) {
     if (!el) {
       el = buildSegmentEl(seg);
       segmentsList.appendChild(el);
+      // scrollHeight only reads correctly once the element is in the DOM.
+      autoGrowTextarea(el.querySelector("textarea"));
       return;
     }
 
@@ -359,6 +369,7 @@ function renderScript(job) {
     const isFocused = document.activeElement === textarea;
     if (!isDirty && !isFocused) {
       textarea.value = seg.text;
+      autoGrowTextarea(textarea);
     }
     el.querySelector(".segment-header span").textContent =
       `Segment ${seg.segment_index} — ${formatStatus(seg.status)}`;
@@ -503,6 +514,10 @@ swapImageForm.addEventListener("submit", async (e) => {
     swapImageBtn.disabled = false;
     swapImageBtn.textContent = "Swap image";
   }
+});
+
+window.addEventListener("resize", () => {
+  segmentsList.querySelectorAll("textarea").forEach(autoGrowTextarea);
 });
 
 // ── Boot ─────────────────────────────────────────────────────────────────

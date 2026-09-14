@@ -304,7 +304,14 @@ button.danger:hover { background: rgba(226, 88, 76, 0.12); filter: none; }
   margin-bottom: 8px;
 }
 .segment-header span { color: var(--muted); font-size: 0.8rem; font-weight: 600; }
-.segment textarea { width: 100%; min-height: 90px; margin-bottom: 10px; }
+.segment textarea {
+  width: 100%;
+  min-height: 120px;
+  margin-bottom: 10px;
+  line-height: 1.55;
+  resize: none;      /* auto-grows via JS instead — no inner scrollbar to fight with */
+  overflow: hidden;
+}
 .segment .segment-actions button {
   padding: 7px 14px;
   font-size: 0.82rem;
